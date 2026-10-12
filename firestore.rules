@@ -1,0 +1,244 @@
+rules_version = '2';
+
+service cloud.firestore {
+  
+  match /documents/{docId}/chunkPages/{pageId} {
+
+  allow read, write: if request.auth != null
+    && get(/databases/$(database)/documents/documents/$(docId)).data.organizationId
+       == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizationId;
+}
+
+    // ---------------------------------------------------------------
+    // HELPERS
+    // ---------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function orgIdOfCaller() {
+      return userDoc().data.organizationId;
+    }
+
+    function roleOfCaller() {
+      return userDoc().data.role;
+    }
+
+    function isSameOrg(orgId) {
+      // orgId != null matters here: without it, two users who've both
+      // signed up but haven't joined/created an org yet both have
+      // organizationId == null, and null == null was letting them read
+      // each other's full users/{uid} profile doc via the read rule below.
+      // Every other caller of isSameOrg() always passes a real org id, so
+      // this can't affect any of them.
+      return isSignedIn() && orgId != null && orgIdOfCaller() == orgId;
+    }
+
+    function hasRole(roles) {
+      return isSignedIn() && roleOfCaller() in roles;
+    }
+
+    function isAdmin() {
+      return hasRole(['admin']);
+    }
+
+    function isAdminOrComplianceOfficer() {
+      return hasRole(['admin', 'compliance_officer']);
+    }
+
+    // No Cloud Functions / Admin SDK in this build (Spark-plan/free-tier
+    // deployment — see SETUP.md). Membership can still only be GRANTED by
+    // you, directly in the Firebase console, since there is no client
+    // write rule for platformAdmins below — this just lets a signed-in
+    // user check their OWN membership so the Admin Console nav item can
+    // gate itself.
+    function isPlatformAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/platformAdmins/$(request.auth.uid));
+    }
+
+    // Deny everything by default; every collection below explicitly opts in.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // USERS  (users/{uid})
+    // ---------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isSameOrg(resource.data.organizationId) || isPlatformAdmin());
+      allow update: if isSignedIn() && request.auth.uid == uid
+                    && request.resource.data.role == resource.data.role // users cannot self-promote
+                    && request.resource.data.organizationId == resource.data.organizationId;
+      // One-time self-serve bootstrap: a user with no org yet may promote
+      // themselves to 'admin' of an org, but only one they just created
+      // (createdBy == themselves) — this replaces what the createOrganization
+      // Cloud Function used to do with the Admin SDK.
+      allow update: if isSignedIn() && request.auth.uid == uid
+                    && resource.data.organizationId == null
+                    && request.resource.data.role == 'admin'
+                    && request.resource.data.organizationId is string
+                    && get(/databases/$(database)/documents/organizations/$(request.resource.data.organizationId)).data.createdBy == request.auth.uid;
+      allow update: if isAdmin() && isSameOrg(resource.data.organizationId); // admins can manage roles
+      allow update: if isPlatformAdmin();
+      allow create: if isSignedIn() && request.auth.uid == uid;
+      allow delete: if isAdmin() && isSameOrg(resource.data.organizationId);
+    }
+
+    // ---------------------------------------------------------------
+    // ORGANIZATIONS  (organizations/{orgId})
+    // ---------------------------------------------------------------
+    match /organizations/{orgId} {
+      allow read: if isSameOrg(orgId) || isPlatformAdmin();
+      allow update: if isAdmin() && isSameOrg(orgId);
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid; // org creation is a direct client write now (no Cloud Function) — see SETUP.md
+      allow delete: if false; // never allow client-side org deletion
+    }
+
+    // ---------------------------------------------------------------
+    // DOCUMENTS  (documents/{docId})
+    // ---------------------------------------------------------------
+    match /documents/{docId} {
+      allow read: if isSameOrg(resource.data.organizationId);
+      allow create: if isSignedIn()
+                    && request.resource.data.organizationId == orgIdOfCaller()
+                    && request.resource.data.uploadedBy == request.auth.uid;
+      // Any signed-in org member: "New Analysis" (bulk re-analysis) is
+      // shown to every member and reanalyzes every document in the org,
+      // not just ones that member uploaded — this has to allow that, same
+      // reasoning as complianceReports/riskAssessments below.
+      allow update: if isSameOrg(resource.data.organizationId);
+      allow delete: if isAdminOrComplianceOfficer() && isSameOrg(resource.data.organizationId);
+    }
+
+    // ---------------------------------------------------------------
+    // COMPLIANCE REPORTS  (complianceReports/{reportId})
+    // ---------------------------------------------------------------
+    match /complianceReports/{reportId} {
+      allow read: if isSameOrg(resource.data.organizationId);
+      // Any signed-in org member, not just admin/compliance_officer: the UI
+      // shows "Generate Report" / "Regenerate with AI" to every member, and
+      // in the old Cloud Functions build those wrote via the Admin SDK
+      // (bypassing this rule entirely) — this now has to actually match
+      // that real behavior since there's no privileged backend left.
+      allow create, update: if isSignedIn() && (
+        request.resource.data.organizationId == orgIdOfCaller() ||
+        isSameOrg(resource.data.organizationId)
+      );
+      allow delete: if isAdmin() && isSameOrg(resource.data.organizationId);
+    }
+
+    // ---------------------------------------------------------------
+    // COMPLIANCE ISSUES  (complianceIssues/{issueId}) — created client-side
+    // from document analysis gaps (no Cloud Functions in this build).
+    // Deletion is still never allowed, so the audit trail of what was
+    // flagged can't be erased from the client.
+    // ---------------------------------------------------------------
+    match /complianceIssues/{issueId} {
+      allow read: if isSameOrg(resource.data.organizationId);
+      allow create: if isSignedIn() && request.resource.data.organizationId == orgIdOfCaller();
+      // Any signed-in org member: the automatic "resolve stale issues on
+      // re-analysis" step in applyAnalysisResult() runs as whichever member
+      // triggered the upload/re-analysis, not just elevated roles — same
+      // reasoning as complianceReports above. This also loosens the manual
+      // "Mark Resolved" button from admin/compliance_officer/analyst-only
+      // to any org member, a real (documented) trade-off of this build.
+      allow update: if isSameOrg(resource.data.organizationId);
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // RISK ASSESSMENTS  (riskAssessments/{riskId})
+    // ---------------------------------------------------------------
+    match /riskAssessments/{riskId} {
+      allow read: if isSameOrg(resource.data.organizationId);
+      // Same reasoning as complianceReports: "New Assessment" is shown to
+      // every org member in the UI and used to run via Admin-SDK bypass.
+      allow create, update: if isSignedIn() && (
+        request.resource.data.organizationId == orgIdOfCaller() ||
+        isSameOrg(resource.data.organizationId)
+      );
+      allow delete: if isAdmin() && isSameOrg(resource.data.organizationId);
+    }
+
+    // ---------------------------------------------------------------
+    // REGULATIONS  (regulations/{regId}) — global read-only reference data,
+    // only writable by backend (Cloud Functions using Admin SDK bypass rules)
+    // ---------------------------------------------------------------
+    match /regulations/{regId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin(); // any org admin can run "Sync Regulation Database" — see SETUP.md
+    }
+
+    // ---------------------------------------------------------------
+    // NOTIFICATIONS  (notifications/{notifId})
+    // ---------------------------------------------------------------
+    match /notifications/{notifId} {
+      allow read, update: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.organizationId == orgIdOfCaller(); // client fans these out now instead of a Cloud Function trigger
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------
+    // CHAT CONVERSATIONS  (chatConversations/{convId}/messages/{msgId})
+    // ---------------------------------------------------------------
+    match /chatConversations/{convId} {
+      allow read, update: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+
+      match /messages/{msgId} {
+        allow read, create: if isSignedIn() && get(/databases/$(database)/documents/chatConversations/$(convId)).data.userId == request.auth.uid;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // AUDIT LOGS  (auditLogs/{logId}) — written client-side, immutable
+    // once created, readable by admins for their own org
+    // ---------------------------------------------------------------
+    match /auditLogs/{logId} {
+      allow read: if isAdmin() && isSameOrg(resource.data.organizationId);
+      allow create: if isSignedIn() && request.resource.data.organizationId == orgIdOfCaller() && request.resource.data.actorUid == request.auth.uid;
+      allow update, delete: if false; // immutable once written, even from the client
+    }
+
+    // ---------------------------------------------------------------
+    // PLATFORM ADMINS  (platformAdmins/{uid}) — deliberately has NO
+    // client read or write rule, in either direction. Membership can
+    // only be granted by YOU, directly in the Firebase console (there is
+    // no Admin SDK / Cloud Function in this build either). isPlatformAdmin()
+    // above uses exists(), which is allowed to check this path regardless
+    // of the rule here — that's what lets the app gate the Admin Console
+    // nav item without ever letting a client read or write this collection.
+    // See SETUP.md §9 for how to add yourself.
+    // ---------------------------------------------------------------
+    match /platformAdmins/{uid} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // RATE LIMITS  (rateLimits/{uid}/buckets/{bucket}) — a per-user,
+    // client-enforced throttle on Gemini-calling actions (chat, analysis,
+    // report generation, etc.), replacing enforceRateLimit() from the old
+    // Cloud Functions build. IMPORTANT: because this build has no server,
+    // this is a UX throttle, not a real security control — a user who
+    // edits their own client can always bypass their own rate-limit doc,
+    // just like they could always call the Gemini API directly with the
+    // key embedded in this page. The real mitigation for abuse is
+    // restricting the Gemini API key itself (HTTP referrer restriction in
+    // Google AI Studio / Cloud Console) — see SETUP.md.
+    // ---------------------------------------------------------------
+    match /rateLimits/{uid}/buckets/{bucket} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ---------------------------------------------------------------
+    // TEAM / INVITES  (organizations/{orgId}/invites/{inviteId})
+    // ---------------------------------------------------------------
+    match /organizations/{orgId}/invites/{inviteId} {
+      allow read, create, delete: if isAdmin() && isSameOrg(orgId);
+    }
+  }
+}
